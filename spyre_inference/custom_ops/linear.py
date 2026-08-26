@@ -30,12 +30,14 @@ from torch.nn.parameter import Parameter
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearMethodBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 
 logger = init_logger(__name__)
 
@@ -115,17 +117,195 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
     """
 
 
-class _SpyreTransposedLinearMixin:
-    """Swaps in `SpyreUnquantizedLinearMethod` for unquantized linear layers.
+class SpyreFp8LinearMethod(LinearMethodBase):
+    """FP8 linear method for Spyre: per-tensor W8A8 using torch-spyre FP8 ops.
 
-    Mixed in before a concrete vLLM linear class so `super().__init__` builds the
-    layer normally; we then replace the unquantized method with the transposed
-    one. Quantized layers keep their own method (and the slow `F.linear` path):
-    the transpose fast path only applies to unquantized weights.
+    Delegates weight creation and loading to vLLM's `Fp8LinearMethod` (which
+    handles checkpoint parameter registration and scale merging), then:
+
+    * `process_weights_after_loading` — DMAs the pre-quantized `float8_e4m3fn`
+      weight directly to Spyre using `_dma_to_spyre_fp8_kernel`, which places it
+      into the `[2, 64]` QFP8WT KERNEL layout expected by `_scaled_mm`.
+      No runtime re-quantization is needed or performed.
+
+    * `apply` — quantizes the activation via
+      `quantize_fp8_with_scale(x, scale_a)` → QFP8CH, then calls
+      `aten._scaled_mm(q_x, w_kernel, scale_a, scale_b)`.  The weight is
+      already in QFP8WT KERNEL layout from DMA; `quantize_weight_fp8_with_scale`
+      is intentionally NOT called.
+
+    Only non-block, non-marlin per-tensor quantization is supported — the
+    standard path for FP8 checkpoints like `granite-3.3-8b-instruct-FP8`.
+    Block-wise and Marlin paths are tracked separately in issue #259.
+    """
+
+    def __init__(self, quant_config):
+        self._delegate = Fp8LinearMethod(quant_config)
+
+    def create_weights(self, layer, input_size_per_partition,
+                       output_partition_sizes, input_size, output_size,
+                       params_dtype, **extra_weight_attrs):
+        # Fp8LinearMethod.create_weights registers weight / weight_scale /
+        # input_scale parameters and then calls init_fp8_linear_kernel to
+        # select a CUDA/XPU kernel — that last step raises ValueError on the
+        # Spyre OOT platform where none of those kernels are available.
+        # All parameter registration happens before the kernel-selection call,
+        # so it is safe to swallow that specific ValueError.
+        try:
+            self._delegate.create_weights(
+                layer, input_size_per_partition, output_partition_sizes,
+                input_size, output_size, params_dtype, **extra_weight_attrs,
+            )
+        except ValueError as exc:
+            if "Failed to find a kernel" not in str(exc):
+                raise
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """DMA the pre-quantized FP8 weight to Spyre in QFP8WT KERNEL layout.
+
+        Steps:
+        1. For fused modules (MergedColumn: gate_up_proj) the checkpoint
+           provides one scale per logical shard.  We take the max scale and
+           re-express each shard's weight in that unified scale (CPU fp32,
+           no CUDA helpers) so a single `_scaled_mm` covers the whole fused
+           weight with one scalar scale.
+
+        2. Normalise weight_scale to a scalar fp32 and set input_scale.
+
+        3. Transpose to [K, N] = [in_features, out_features] — the shape
+           `_scaled_mm` expects for the weight operand.
+
+        4. Call `_dma_to_spyre_fp8_kernel(weight_KN)` — this DMAs the
+           `float8_e4m3fn` tensor ([K, N]) directly to Spyre with the `[2, 64]`
+           QFP8WT KERNEL layout and `dim_order=[0, 1]`.  This is the exact
+           layout `_qfp8wt_stl` in torch-spyre's propagate_layouts produces,
+           so no ReStickify is needed at compile time.
+        """
+        from vllm.model_executor.utils import replace_parameter
+        from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
+
+        weight: torch.Tensor = layer.weight        # [N, K], float8_e4m3fn
+        weight_scale: torch.Tensor = layer.weight_scale  # scalar or [num_shards]
+        input_scale = getattr(layer, "input_scale", None)
+
+        # --- merge per-shard scales for fused modules (CPU, fp32, no CUDA) ---
+        if weight_scale.numel() > 1:
+            # weight_scale is [num_shards]; each shard covers logical_widths[i] rows.
+            # Re-quantize each shard to the global max scale so _scaled_mm sees
+            # a single uniform scale.
+            max_scale = weight_scale.max().to(torch.float32)
+            weight_f32 = weight.to(torch.float32)
+
+            from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
+            new_w = torch.empty_like(weight_f32)
+            offset = 0
+            for shard_rows, shard_scale in zip(layer.logical_widths, weight_scale):
+                shard = weight_f32[offset:offset + shard_rows]
+                new_w[offset:offset + shard_rows] = (
+                    shard * shard_scale.to(torch.float32) / max_scale
+                ).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX)
+                offset += shard_rows
+
+            weight = new_w.to(torch.float8_e4m3fn)
+            weight_scale = max_scale
+        else:
+            weight_scale = weight_scale.reshape([]).to(torch.float32)
+
+        if self._delegate.act_q_static and input_scale is not None:
+            input_scale = input_scale.max()
+
+        # Transpose to [K, N] = [in_features, out_features] for _scaled_mm,
+        # then DMA to Spyre with QFP8WT KERNEL layout ([2,64] sticks, dim_order=[0,1]).
+        # _dma_to_spyre_fp8_kernel expects the weight in the shape _scaled_mm sees
+        # it: [K, N] (matches _qfp8wt_stl dim_order=[0,1] with identity layout).
+        weight = _dma_to_spyre_fp8_kernel(weight.t().contiguous())
+
+        # Store scales as fp16 on device now so apply() needs no dtype conversion
+        # inside the compiled region (a .to(fp16) inside the graph creates a
+        # STANDARD-layout buffer that triggers a mixed-EA error when fused with
+        # the QFP8WT weight).
+        weight_scale_fp16 = weight_scale.to(torch.float16)
+
+        replace_parameter(layer, "weight", weight.data)
+        replace_parameter(layer, "weight_scale", weight_scale_fp16)
+
+        if input_scale is not None:
+            replace_parameter(layer, "input_scale",
+                              input_scale.to(torch.float16))
+        else:
+            layer.input_scale = None
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = layer.weight              # [K, N] QFP8WT KERNEL on Spyre
+        weight_scale = layer.weight_scale  # scalar, float16
+
+        # Scales are already fp16 (stored as such in process_weights_after_loading).
+        scale_a = layer.input_scale if layer.input_scale is not None \
+            else torch.ones(1, dtype=torch.float16, device=x.device)
+        scale_b = weight_scale  # already fp16
+
+        # Quantize activation to QFP8CH layout.
+        q_x = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+
+        # weight is already in QFP8WT KERNEL layout from process_weights_after_loading.
+        # Do NOT call quantize_weight_fp8_with_scale — the weight is pre-placed.
+        out = torch.ops.aten._scaled_mm(
+            q_x, weight,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            bias=None,
+            out_dtype=torch.float16,
+        )
+        if bias is not None:
+            out = out + bias
+        return out
+
+
+class _SpyreTransposedLinearMixin:
+    """Swaps in Spyre-specific linear methods.
+
+    - `UnquantizedLinearMethod` → `SpyreUnquantizedLinearMethod` (transposed weight)
+    - `Fp8LinearMethod`         → `SpyreFp8LinearMethod` (FP8 matmul via torch-spyre)
+
+    The swap must happen *before* `LinearBase.__init__` calls
+    `self.quant_method.create_weights`, because `Fp8LinearMethod.create_weights`
+    ends by calling `init_fp8_linear_kernel` which raises `ValueError` on the
+    Spyre OOT platform (no CUDA/XPU kernels available).  We intercept by
+    monkey-patching `quant_config.get_quant_method` on the kwargs instance so
+    that `LinearBase.__init__` installs `SpyreFp8LinearMethod` directly instead
+    of `Fp8LinearMethod`.
     """
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        quant_config = kwargs.get("quant_config") or (args[6] if len(args) > 6 else None)
+
+        # Patch quant_config.get_quant_method so LinearBase.__init__ installs
+        # SpyreFp8LinearMethod instead of Fp8LinearMethod before create_weights.
+        _orig_get_quant_method = None
+        if quant_config is not None and hasattr(quant_config, "get_quant_method"):
+            _orig = quant_config.get_quant_method
+
+            def _patched_get_quant_method(layer, prefix=""):
+                method = _orig(layer, prefix=prefix)
+                if isinstance(method, Fp8LinearMethod):
+                    return SpyreFp8LinearMethod(method.quant_config)
+                return method
+
+            quant_config.get_quant_method = _patched_get_quant_method
+            _orig_get_quant_method = _orig
+
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            # Restore original method to avoid side-effects on shared config.
+            if _orig_get_quant_method is not None:
+                quant_config.get_quant_method = _orig_get_quant_method
+
         if isinstance(self.quant_method, UnquantizedLinearMethod):
             self.quant_method = SpyreUnquantizedLinearMethod()
 
