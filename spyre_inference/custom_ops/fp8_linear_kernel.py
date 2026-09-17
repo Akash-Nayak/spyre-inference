@@ -187,15 +187,10 @@ def _fp8_mm(
 
 
 def _use_prequant() -> bool:
-    """Return True unless explicitly disabled via ``SPYRE_FP8_PREQUANT_FORCE=0``.
+    """Return True unless explicitly disabled via ``SPYRE_FP8_PREQUANT_FORCE=0``."""
+    from spyre_inference import envs
 
-    ``SPYRE_FP8_PREQUANT_FORCE=0`` forces the fallback path (qfp8wt inside the
-    compiled graph every forward) — useful for numerical comparison / debugging.
-    Any other value (including unset) uses the prequant path.
-    """
-    import os
-
-    return os.environ.get("SPYRE_FP8_PREQUANT_FORCE", "") != "0"
+    return envs.SPYRE_FP8_PREQUANT_FORCE
 
 
 def _fp16_weight_for_qfp8wt(

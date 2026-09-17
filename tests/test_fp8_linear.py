@@ -77,20 +77,6 @@ def _make_kernel(*, granite_channel: bool = False):
     )
 
 
-# Non-strict: this shape still compiles on some deeptools/dxp_standalone builds,
-# and an xpass is the signal that the backend fix landed.
-_XFAIL_M1 = pytest.param(
-    1,
-    marks=pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "dxp_standalone fails to compile the fused activation-quantize + "
-            "_scaled_mm graph for the M=1 decode shape"
-        ),
-    ),
-)
-
-
 @pytest.mark.fp8
 class TestSpyreFp8LinearKernel:
     def test_register(self):
@@ -219,7 +205,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre.
 
@@ -290,7 +276,7 @@ class TestSpyreFp8LinearKernel:
         assert out3d.shape == (batch, seq_len, out_features)
         torch.testing.assert_close(out3d.reshape_as(out2d), out2d, atol=0.0, rtol=0.0)
 
-    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
         if not spyre_available():
@@ -644,4 +630,58 @@ class TestSpyreFp8PrequantPath:
 
         assert id_first == id_second, (
             "_qfp8wt_for_mm tensor was rebuilt on second forward — expected cache reuse"
+        )
+
+    @pytest.mark.parametrize("out_features", [6144, 25600])
+    def test_prequant_wide_multitile_matches_fallback(self, out_features, monkeypatch):
+        """Wide fused projections (QKV N=6144, gate_up N=25600) are N-split into
+        SuperDSC tiles; prequant output matches the fallback path."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        torch.manual_seed(42)
+        in_features = 4096
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        x = torch.randn(1, in_features, dtype=torch.float16)
+
+        # --- fallback path ---
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "0")
+        layer_base = torch.nn.Module()
+        _wfp8, ws = _quantize_weight_fp8(weight_kn)
+        layer_base.weight = torch.nn.Parameter(_wfp8, requires_grad=False)
+        layer_base.weight_scale = torch.nn.Parameter(ws.reshape(1), requires_grad=False)
+        kernel.process_weights_after_loading(layer_base)
+        layer_base.weight = torch.nn.Parameter(
+            weight_kn.contiguous().to("spyre"), requires_grad=False
+        )
+        layer_base.weight_scale = torch.nn.Parameter(
+            layer_base.weight_scale.data.to("spyre"), requires_grad=False
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_base = kernel.apply_weights(layer_base, x.to("spyre")).cpu()
+
+        # --- prequant path ---
+        monkeypatch.delenv("SPYRE_FP8_PREQUANT_FORCE", raising=False)
+        layer_pre = torch.nn.Module()
+        self._prepare_prequant_layer(layer_pre, kernel, weight_kn, per_channel=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_pre = kernel.apply_weights(layer_pre, x.to("spyre")).cpu()
+
+        assert out_base.shape == out_pre.shape
+        max_diff = (out_base.float() - out_pre.float()).abs().max().item()
+        assert max_diff < 0.2, (
+            f"Wide multi-tile prequant and fallback differ: max_diff={max_diff:.6f} "
+            f"(out_features={out_features})"
         )
