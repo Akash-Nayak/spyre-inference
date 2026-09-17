@@ -63,7 +63,7 @@ compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
-| FP8 linear (`Fp8LinearMethod`, compressed-tensors) | `SpyreFp8LinearKernel` | Spyre | Registered via `register_spyre_fp8_linear_kernel()` for `PlatformEnum.OOT`. Keeps checkpoint `float8_e4m3fn` weights as-is through `process_weights_after_loading`. On first forward, dequantizes fp8→fp16 on CPU and moves to Spyre; from there, two paths are possible — see [FP8 weight lifecycle](#fp8-weight-lifecycle) below. `apply_weights` is `@torch._dynamo.disable(recursive=False)` so the outer block compile uses `fullgraph=False` for FP8 models |
+| FP8 linear (`Fp8LinearMethod`, compressed-tensors) | `SpyreFp8LinearKernel` | Spyre | Registered via `register_spyre_fp8_linear_kernel()` for `PlatformEnum.OOT`. Keeps checkpoint `float8_e4m3fn` weights as-is through `process_weights_after_loading`. On first forward, dequantizes fp8→fp16 on CPU and moves to Spyre; from there, two paths are possible — see [FP8 weight lifecycle](#fp8-weight-lifecycle) below. `apply_weights` is `@torch._dynamo.disable(recursive=False)` so the outer block compile uses `fullgraph=False` for FP8 models. Prequant path requires [torch-spyre#3172](https://github.com/torch-spyre/torch-spyre/pull/3172) |
 
 ### FP8 weight lifecycle
 
@@ -83,7 +83,7 @@ lifecycle. The prequant or fallback path is selected by the
   qfp8ch  = quantize_fp8_with_scale(x, scale_a)             ← in compiled graph
   out     = aten._scaled_mm(qfp8ch, qfp8wt, ...)            ← in compiled graph
 
-[first forward, fallback path — pinned torch-spyre]
+[first forward, fallback path (SPYRE_FP8_PREQUANT_FORCE=0)]
   w_fp16  = dequant(fp8_weight) on CPU → .to("spyre")
   layer._fp16_for_qfp8wt = w_fp16                           ← cached until device changes
 [every forward]
